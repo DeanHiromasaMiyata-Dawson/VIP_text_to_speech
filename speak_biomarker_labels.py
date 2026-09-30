@@ -537,6 +537,19 @@ class VoiceCoach:
         return key, ctx
 
 
+def speak_isolated(text: str, rate: int = 175) -> None:
+    """Speak via a throwaway process so pyttsx3 can't get stuck after the first utterance."""
+    print(f"[speaking] {text}", flush=True)
+    code = (
+        "import sys, pyttsx3\n"
+        "e = pyttsx3.init()\n"
+        "e.setProperty('rate', int(sys.argv[2]))\n"
+        "e.say(sys.argv[1])\n"
+        "e.runAndWait()\n"
+    )
+    subprocess.run([sys.executable, "-c", code, text, str(rate)])
+
+
 def coach_speak(text, tone, lang, dry_run, engine_holder, rate=175):
     """Speak with a calm/firm macOS voice if available, else the original pyttsx3 speak()."""
     if dry_run:
@@ -551,9 +564,7 @@ def coach_speak(text, tone, lang, dry_run, engine_holder, rate=175):
         if subprocess.run(cmd + [text], capture_output=True).returncode != 0:
             subprocess.run(["say", "-r", str(rate), text])  # voice not installed
         return
-    if "engine" not in engine_holder:
-        engine_holder["engine"] = build_tts_engine(rate=rate)
-    speak(engine_holder["engine"], text)
+    speak_isolated(text, rate)
 
 
 COACH_LOG_PATH = Path(__file__).with_name("voice_alert_log.csv")
