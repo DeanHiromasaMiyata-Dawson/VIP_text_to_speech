@@ -46,6 +46,34 @@ USAGE NOTES
   either model is "ready". Until then this script announces "Pending" once,
   then announces the real label once it resolves.
 
+VOICE COACH MODE (added for the construction worker stress-feedback assignment)
+-------------------------------------------------------------------------------
+Everything above still works exactly as before. Adding --coach switches from
+announcing labels to giving the worker short, escalating spoken messages:
+
+    High stress            -> "Are you feeling tired? Please have some water."
+    20 min of stress       -> "Please take a break; you've been stressed for 20 minutes."
+    45 min of stress       -> required break (repeats every 10 min while it continues)
+    Heat strain            -> warm skin + fast pulse: shade and water
+    Racing heart           -> pulse above limit for 2 min: slow down, watch footing
+    Focus-heavy work       -> high mental demand only: double-check critical steps
+    Recovery               -> 5 calm minutes after an episode: positive feedback
+    Hydration              -> every 60 min on shift
+
+Design rules: one message at a time (highest priority wins), per-alert
+cooldowns, low-confidence predictions ignored (frustration macro-F1 ~0.61,
+mental demand ~0.52), calm voice for check-ins and firm voice for safety
+alerts (macOS `say`, else the pyttsx3 engine above), English or Spanish.
+Every coach alert is logged to voice_alert_log.csv next to this file.
+
+       python speak_biomarker_labels.py --coach                          # live data
+       python speak_biomarker_labels.py --simulate                       # 70-min shift demo, no wristband
+       python speak_biomarker_labels.py --simulate --worker-name Carlos
+       python speak_biomarker_labels.py --simulate --lang es
+       python speak_biomarker_labels.py --simulate --dry-run             # print only, no audio
+
+Messages live in COACH_MESSAGES and thresholds in COACH_CONFIG.
+
 SECURITY NOTE
 -------------
 avro_stream_poller_with_ml.py (as provided) contains hardcoded AWS
@@ -59,6 +87,16 @@ import argparse
 import sys
 import time
 from typing import Optional
+
+# Added for voice coach mode
+import csv
+import platform
+import random
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import requests
 
@@ -210,9 +248,14 @@ def run_loop(endpoint: str, interval: int, debug: bool) -> None:
                     speak(engine, utterance)
                 last_mental_demand = m_label
 
-            if f_label is None and m_label is None and payload.get("note") not in (
-                "waiting for first sample",
-                "waiting for biomarker files",
+            if (
+                f_label is None
+                and m_label is None
+                and payload.get("note")
+                not in (
+                    "waiting for first sample",
+                    "waiting for biomarker files",
+                )
             ):
                 print(
                     f"[info] no predictions yet -- poller note: {payload.get('note')!r}",
@@ -220,6 +263,426 @@ def run_loop(endpoint: str, interval: int, debug: bool) -> None:
                 )
 
         time.sleep(interval)
+
+
+# ==========================================================================
+# VOICE COACH MODE (added)
+# Everything below this line until main() is new. The functions above are
+# the instructor's original code and are reused as-is (fetch_latest,
+# build_tts_engine, speak).
+# ==========================================================================
+
+LEVEL = {"low": 0, "medium": 1, "high": 2}
+
+COACH_CONFIG = {
+    "min_confidence": 0.55,  # ignore model labels below this confidence
+    "microbreak_after_min": 20,  # sustained stress -> short break
+    "required_break_after_min": 45,  # sustained stress -> required break
+    "required_break_repeat_min": 10,
+    "grace_low_minutes": 3,  # calm minutes in a row that end an unalerted episode
+    "recovery_calm_minutes": 5,  # calm minutes needed for "nice work" feedback
+    "heat_skin_temp_c": 35.0,  # wrist skin temp (not core temp). Heuristic, tune per site
+    "heat_pulse_bpm": 110,
+    "high_pulse_bpm": 120,
+    "high_pulse_minutes": 2,
+    "hydration_every_min": 60,
+    "cooldown_min": {  # minimum minutes between repeats of the same alert
+        "heat": 15,
+        "heart": 10,
+        "focus": 20,
+        "checkin": 30,
+        "hydration": 60,
+    },
+}
+
+# The FIRST phrasing in each list is the default (the assignment's exact
+# wording where one was given). --vary picks randomly from the list.
+# {name} becomes ", Carlos" (or nothing); {minutes} becomes the duration.
+COACH_MESSAGES = {
+    "en": {
+        "checkin": [
+            "Are you feeling tired{name}? Please have some water.",
+            "Quick check-in{name}. Your stress is running high. Grab some water and take three slow breaths.",
+            "Hey{name}, your body is working hard right now. Take a sip of water and reset for a moment.",
+        ],
+        "microbreak": [
+            "Please take a break{name}; you've been stressed for {minutes} minutes.",
+            "You've been under strain for {minutes} minutes{name}. Finish your current step safely, then step back for two minutes.",
+            "{minutes} minutes of high stress{name}. When it's safe, set your tools down and take a short breather.",
+        ],
+        "required_break": [
+            "Please take a break{name}; you've been stressed for {minutes} minutes. Stop at a safe point and rest for ten minutes.",
+            "Stop at a safe point{name}. You've been stressed for {minutes} minutes. Take a ten minute break in the rest area.",
+            "{minutes} minutes of continuous stress{name}. Please secure your work, let your lead know, and take a real break now.",
+        ],
+        "heat": [
+            "Heat alert{name}. Your skin temperature and heart rate are both up. Move to shade and drink water.",
+            "Signs of heat strain{name}. Get out of the sun, loosen your gear, and hydrate before you continue.",
+        ],
+        "heart": [
+            "Your heart rate is high{name}. Slow down, check your footing, and stay clear of moving equipment.",
+            "Heart rate is elevated{name}. Ease off for a minute and keep three points of contact if you're on a ladder.",
+        ],
+        "focus": [
+            "This task is demanding{name}. Double-check your harness, tie-off, and signals before the next critical step.",
+            "High focus work detected{name}. Slow is smooth. Confirm with your spotter before the next lift.",
+        ],
+        "recovery": [
+            "Nice work{name}. Your readings are back to normal. Keep pacing yourself.",
+            "You're back in the green{name}. Good job taking that break.",
+        ],
+        "hydration": [
+            "Hourly reminder{name}. Drink a cup of water, even if you're not thirsty.",
+        ],
+    },
+    "es": {
+        "checkin": [
+            "¿Te sientes cansado{name}? Por favor, toma agua.",
+            "Revisión rápida{name}. Tu nivel de estrés está alto. Toma agua y respira hondo tres veces.",
+        ],
+        "microbreak": [
+            "Por favor, toma un descanso{name}; llevas {minutes} minutos con estrés.",
+            "Llevas {minutes} minutos bajo presión{name}. Termina este paso con cuidado y descansa dos minutos.",
+        ],
+        "required_break": [
+            "Por favor, toma un descanso{name}; llevas {minutes} minutos con estrés. Detente en un punto seguro y descansa diez minutos.",
+            "{minutes} minutos de estrés continuo{name}. Asegura tu trabajo, avisa a tu supervisor y descansa ahora.",
+        ],
+        "heat": [
+            "Alerta de calor{name}. Tu temperatura y tu ritmo cardíaco están altos. Ve a la sombra y toma agua.",
+        ],
+        "heart": [
+            "Tu ritmo cardíaco está alto{name}. Baja el ritmo, cuida tu paso y aléjate de la maquinaria.",
+        ],
+        "focus": [
+            "Esta tarea exige mucha concentración{name}. Revisa tu arnés y tus señales antes del siguiente paso.",
+        ],
+        "recovery": [
+            "Buen trabajo{name}. Tus lecturas volvieron a la normalidad.",
+        ],
+        "hydration": [
+            "Recordatorio{name}. Toma un vaso de agua, aunque no tengas sed.",
+        ],
+    },
+}
+
+# Priority (higher wins) and voice tone for each alert.
+COACH_ALERTS = {
+    "required_break": (100, "firm"),
+    "heat": (90, "firm"),
+    "heart": (80, "firm"),
+    "microbreak": (60, "calm"),
+    "checkin": (50, "calm"),
+    "focus": (40, "calm"),
+    "recovery": (30, "calm"),
+    "hydration": (10, "calm"),
+}
+
+# macOS voices (run `say -v '?'` to see what's installed).
+COACH_VOICES = {
+    "en": {"calm": "Samantha", "firm": "Daniel"},
+    "es": {"calm": "Paulina", "firm": "Jorge"},
+}
+
+
+@dataclass
+class CoachState:
+    shift_start: datetime = None
+    episode_start: datetime = None  # when the current stress episode began
+    episode_peak_tier: int = 0  # 0 none, 1 check-in, 2 micro-break, 3 required break
+    calm_streak: int = 0
+    high_pulse_streak: int = 0
+    last_required_break: datetime = None
+    last_fired: dict = field(default_factory=dict)
+
+
+def coach_label(pred, min_conf):
+    """Return 'low'/'medium'/'high', or None if not ready or low confidence."""
+    if not pred or not pred.get("ready") or pred.get("label") is None:
+        return None
+    conf = pred.get("confidence")
+    if conf is not None and conf < min_conf:
+        return None
+    return str(pred["label"]).lower()
+
+
+def stress_level(fr, md):
+    """Combine both model outputs into 0 (calm), 1 (elevated), 2 (high)."""
+    fr_l, md_l = LEVEL.get(fr, -1), LEVEL.get(md, -1)
+    if fr_l == 2 or (fr_l == 1 and md_l == 2):
+        return 2
+    if fr_l == 1 or md_l == 2:
+        return 1
+    return 0
+
+
+class VoiceCoach:
+    """Turns a stream of minute-level samples into at most one alert per sample."""
+
+    def __init__(self, config=COACH_CONFIG):
+        self.cfg = config
+        self.s = CoachState()
+
+    def _cooled_down(self, key, now):
+        last = self.s.last_fired.get(key)
+        mins = self.cfg["cooldown_min"].get(key, 0)
+        return last is None or (now - last) >= timedelta(minutes=mins)
+
+    def evaluate(self, sample, now):
+        """Return (alert_key, context) for the most important alert, or (None, context)."""
+        cfg, s = self.cfg, self.s
+        preds = sample.get("predictions") or {}
+        fr = coach_label(preds.get("frustration"), cfg["min_confidence"])
+        md = coach_label(preds.get("mental_demand"), cfg["min_confidence"])
+        level = stress_level(fr, md)
+        pulse = sample.get("pulse_rate")
+        temp = sample.get("temp")
+
+        if s.shift_start is None:
+            s.shift_start = now
+        candidates = []
+
+        # --- Stress episode tracking (with a grace period for noisy minutes) ---
+        if level >= 1:
+            s.calm_streak = 0
+            if s.episode_start is None:
+                s.episode_start = now
+        else:
+            s.calm_streak += 1
+
+        if s.episode_start is not None:
+            minutes = int((now - s.episode_start).total_seconds() // 60)
+            if minutes >= cfg["required_break_after_min"]:
+                due = (
+                    s.last_required_break is None
+                    or now - s.last_required_break
+                    >= timedelta(minutes=cfg["required_break_repeat_min"])
+                )
+                if due and level >= 1:
+                    candidates.append(("required_break", {"minutes": minutes}))
+            elif (
+                minutes >= cfg["microbreak_after_min"]
+                and s.episode_peak_tier < 2
+                and level >= 1
+            ):
+                candidates.append(("microbreak", {"minutes": minutes}))
+            elif (
+                level == 2
+                and s.episode_peak_tier < 1
+                and self._cooled_down("checkin", now)
+            ):
+                candidates.append(("checkin", {}))
+
+            # A few calm minutes end the episode (one noisy reading doesn't).
+            # If the worker had been alerted, confirm recovery with positive feedback.
+            if (
+                s.calm_streak >= cfg["recovery_calm_minutes"]
+                and s.episode_peak_tier >= 1
+            ):
+                candidates.append(("recovery", {}))
+                s.episode_start, s.episode_peak_tier = None, 0
+            elif s.calm_streak >= cfg["grace_low_minutes"] and s.episode_peak_tier == 0:
+                s.episode_start = None
+
+        # --- Physiological safety rules (independent of the ML models) ---
+        if pulse is not None and pulse >= cfg["high_pulse_bpm"]:
+            s.high_pulse_streak += 1
+        else:
+            s.high_pulse_streak = 0
+
+        if (
+            temp is not None
+            and pulse is not None
+            and temp >= cfg["heat_skin_temp_c"]
+            and pulse >= cfg["heat_pulse_bpm"]
+            and self._cooled_down("heat", now)
+        ):
+            candidates.append(("heat", {}))
+        if s.high_pulse_streak >= cfg["high_pulse_minutes"] and self._cooled_down(
+            "heart", now
+        ):
+            candidates.append(("heart", {}))
+
+        # --- High mental demand while frustration is fine ---
+        if (
+            md == "high"
+            and fr in (None, "low")
+            and level < 2
+            and self._cooled_down("focus", now)
+        ):
+            candidates.append(("focus", {}))
+
+        # --- Hydration reminder ---
+        on_shift = (now - s.shift_start).total_seconds() / 60
+        last_h = s.last_fired.get("hydration")
+        if on_shift >= cfg["hydration_every_min"] and (
+            last_h is None
+            or now - last_h >= timedelta(minutes=cfg["hydration_every_min"])
+        ):
+            candidates.append(("hydration", {}))
+
+        if not candidates:
+            return None, {"fr": fr, "md": md, "level": level}
+
+        key, ctx = max(candidates, key=lambda c: COACH_ALERTS[c[0]][0])
+        s.last_fired[key] = now
+        if key == "checkin":
+            s.episode_peak_tier = max(s.episode_peak_tier, 1)
+        elif key == "microbreak":
+            s.episode_peak_tier = max(s.episode_peak_tier, 2)
+        elif key == "required_break":
+            s.episode_peak_tier = 3
+            s.last_required_break = now
+        ctx.update({"fr": fr, "md": md, "level": level})
+        return key, ctx
+
+
+def coach_speak(text, tone, lang, dry_run, engine_holder, rate=175):
+    """Speak with a calm/firm macOS voice if available, else the original pyttsx3 speak()."""
+    if dry_run:
+        print(f"[speaking:{tone}] {text}", flush=True)
+        return
+    if platform.system() == "Darwin" and shutil.which("say"):
+        print(f"[speaking:{tone}] {text}", flush=True)
+        voice = COACH_VOICES.get(lang, COACH_VOICES["en"]).get(tone)
+        cmd = ["say", "-r", str(rate)]
+        if voice:
+            cmd += ["-v", voice]
+        if subprocess.run(cmd + [text], capture_output=True).returncode != 0:
+            subprocess.run(["say", "-r", str(rate), text])  # voice not installed
+        return
+    if "engine" not in engine_holder:
+        engine_holder["engine"] = build_tts_engine(rate=rate)
+    speak(engine_holder["engine"], text)
+
+
+COACH_LOG_PATH = Path(__file__).with_name("voice_alert_log.csv")
+
+
+def log_alert(sample, key, ctx, text):
+    new = not COACH_LOG_PATH.exists()
+    with COACH_LOG_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(
+                [
+                    "logged_at",
+                    "participant_id",
+                    "alert",
+                    "frustration",
+                    "mental_demand",
+                    "pulse_rate",
+                    "skin_temp",
+                    "message",
+                ]
+            )
+        w.writerow(
+            [
+                datetime.now().isoformat(timespec="seconds"),
+                sample.get("participant_id"),
+                key,
+                ctx.get("fr"),
+                ctx.get("md"),
+                sample.get("pulse_rate"),
+                sample.get("temp"),
+                text,
+            ]
+        )
+
+
+def sample_time(sample):
+    for k in ("eda_time", "temp_time", "pulse_time", "updated_at"):
+        v = sample.get(k)
+        if v:
+            try:
+                return datetime.fromisoformat(str(v).replace("Z", "+00:00")).replace(
+                    tzinfo=None
+                )
+            except ValueError:
+                continue
+    return datetime.now()
+
+
+def live_samples(endpoint, interval, debug):
+    """Yield each new minute-level sample from the poller (uses the original fetch_latest)."""
+    last_sig = None
+    print(f"Coach listening to {endpoint} every {interval}s. Press Ctrl+C to stop.")
+    while True:
+        data = fetch_latest(endpoint)
+        if data:
+            if debug:
+                print(f"[debug] raw payload: {data}")
+            sig = (data.get("participant_id"), data.get("updated_at"))
+            if data.get("predictions") and sig != last_sig:
+                last_sig = sig
+                yield data, sample_time(data)
+        time.sleep(interval)
+
+
+def simulated_samples(seconds_per_minute):
+    """A 70-minute shift: calm start, long stress episode with a heat spike, then recovery."""
+
+    def pred(label, conf=0.8):
+        return {"label": label, "confidence": conf, "ready": True}
+
+    start = datetime.now()
+    print(
+        f"Simulating a 70-minute shift ({seconds_per_minute}s per minute). Ctrl+C to stop."
+    )
+    for m in range(71):
+        if m < 8:
+            fr, md, pulse, temp = "low", "low", 82, 32.5
+        elif m < 12:
+            fr, md, pulse, temp = "low", "high", 92, 33.0  # focus-heavy task
+        elif m < 60:
+            fr, md, pulse, temp = ("high" if m % 7 else "medium"), "high", 104, 33.8
+            if 30 <= m <= 33:
+                pulse, temp = 118, 35.6  # hot afternoon, heat strain
+            if 50 <= m <= 52:
+                pulse = 126  # racing heart
+        else:
+            fr, md, pulse, temp = "low", "low", 84, 33.0  # after the break
+        yield (
+            {
+                "participant_id": "SIM-WORKER",
+                "pulse_rate": pulse,
+                "temp": temp,
+                "predictions": {
+                    "frustration": pred(fr),
+                    "mental_demand": pred(md, 0.7),
+                },
+            },
+            start + timedelta(minutes=m),
+        )
+        time.sleep(seconds_per_minute)
+
+
+def run_coach(args) -> None:
+    """Voice coach: speak escalating safety messages based on patterns over time."""
+    coach = VoiceCoach()
+    engine_holder = {}
+    name = f", {args.worker_name}" if args.worker_name else ""
+    source = (
+        simulated_samples(args.speed)
+        if args.simulate
+        else live_samples(args.endpoint, args.interval, args.debug)
+    )
+
+    for sample, now in source:
+        key, ctx = coach.evaluate(sample, now)
+        minute = int((now - coach.s.shift_start).total_seconds() // 60)
+        if key is None:
+            print(
+                f"  min {minute:>3}  fr={ctx['fr']} md={ctx['md']} "
+                f"pulse={sample.get('pulse_rate')} temp={sample.get('temp')}  (quiet)"
+            )
+            continue
+        options = COACH_MESSAGES[args.lang][key]
+        template = random.choice(options) if args.vary else options[0]
+        text = template.format(name=name, **ctx)
+        print(f"  min {minute:>3}  -> {key.upper()}")
+        coach_speak(text, COACH_ALERTS[key][1], args.lang, args.dry_run, engine_holder)
+        log_alert(sample, key, ctx, text)
 
 
 def main() -> None:
@@ -245,10 +708,51 @@ def main() -> None:
         action="store_true",
         help="Print the raw JSON payload on every poll for troubleshooting",
     )
+    # --- Added for voice coach mode ---
+    parser.add_argument(
+        "--coach",
+        action="store_true",
+        help="Voice coach mode: escalating stress/safety messages instead of label announcements",
+    )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="Coach demo with a scripted 70-minute shift, no wristband needed (implies --coach)",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.5,
+        help="Seconds per simulated minute (default: 1.5)",
+    )
+    parser.add_argument(
+        "--lang",
+        choices=["en", "es"],
+        default="en",
+        help="Coach message language (default: en)",
+    )
+    parser.add_argument(
+        "--worker-name",
+        default="",
+        help="Personalize coach messages, e.g. --worker-name Carlos",
+    )
+    parser.add_argument(
+        "--vary",
+        action="store_true",
+        help="Rotate through alternative phrasings instead of the assignment's exact wording",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Coach mode: print messages without audio",
+    )
     args = parser.parse_args()
 
     try:
-        run_loop(args.endpoint, args.interval, args.debug)
+        if args.coach or args.simulate:
+            run_coach(args)
+        else:
+            run_loop(args.endpoint, args.interval, args.debug)
     except KeyboardInterrupt:
         print("\nStopped.")
 
