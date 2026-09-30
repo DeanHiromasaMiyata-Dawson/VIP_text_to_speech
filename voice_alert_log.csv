@@ -1,0 +1,11 @@
+logged_at,participant_id,alert,frustration,mental_demand,pulse_rate,skin_temp,message
+2026-09-30T11:18:27,SIM-WORKER,focus,low,high,92,33.0,"This task is demanding, Carlos. Double-check your harness, tie-off, and signals before the next critical step."
+2026-09-30T11:18:33,SIM-WORKER,checkin,high,high,104,33.8,"Are you feeling tired, Carlos? Please have some water."
+2026-09-30T11:18:57,SIM-WORKER,microbreak,medium,high,104,33.8,"Please take a break, Carlos; you've been stressed for 20 minutes."
+2026-09-30T11:19:00,SIM-WORKER,heat,high,high,118,35.6,"Heat alert, Carlos. Your skin temperature and heart rate are both up. Move to shade and drink water."
+2026-09-30T11:19:32,SIM-WORKER,heart,high,high,126,33.8,"Your heart rate is high, Carlos. Slow down, check your footing, and stay clear of moving equipment."
+2026-09-30T11:19:35,SIM-WORKER,required_break,high,high,104,33.8,"Please take a break, Carlos; you've been stressed for 45 minutes. Stop at a safe point and rest for ten minutes."
+2026-09-30T11:19:45,SIM-WORKER,hydration,low,low,84,33.0,"Hourly reminder, Carlos. Drink a cup of water, even if you're not thirsty."
+2026-09-30T11:19:52,SIM-WORKER,recovery,low,low,84,33.0,"Nice work, Carlos. Your readings are back to normal. Keep pacing yourself."
+2026-09-30T11:30:39,SIM-WORKER,focus,low,high,92,33.0,"This task is demanding, Carlos. Double-check your harness, tie-off, and signals before the next critical step."
+2026-09-30T11:30:50,SIM-WORKER,checkin,high,high,104,33.8,"Are you feeling tired, Carlos? Please have some water."
