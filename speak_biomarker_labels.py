@@ -100,6 +100,11 @@ from pathlib import Path
 
 import requests
 
+import asyncio
+import ctypes
+import os
+import tempfile
+
 try:
     import pyttsx3
 except ImportError:
@@ -271,6 +276,11 @@ def run_loop(endpoint: str, interval: int, debug: bool) -> None:
 # the instructor's original code and are reused as-is (fetch_latest,
 # build_tts_engine, speak).
 # ==========================================================================
+
+EDGE_VOICES = {
+    "en": {"calm": "en-US-AriaNeural", "firm": "en-US-GuyNeural"},
+    "es": {"calm": "es-MX-DaliaNeural", "firm": "es-MX-JorgeNeural"},
+}
 
 LEVEL = {"low": 0, "medium": 1, "high": 2}
 
@@ -537,6 +547,30 @@ class VoiceCoach:
         return key, ctx
 
 
+def _play_mp3_windows(path: str) -> None:
+    """Play an mp3 and block until done, using built-in Windows MCI (no extra dependency)."""
+    mci = ctybes.windll.winmm.mciSendStringW
+    mci(f'open "{path}" type mpegvideo alias coachaudio', None, 0, None)
+    mci("play coachaudio wait", None, 0, None)
+    mci("close coachaudio", None, 0, None)
+
+
+def speak_edge(text: str, lang: str, tone: str, rate: int = 175) -> None:
+    """Speak with a Microsoft neural voice (needs internet). Raises on failure"""
+    import edge_tts
+
+    voice = EDGE_VOICES.get(lang, EDGE_VOICES["en"])[tone]
+    pct = round((rate - 175) / 175 * 100)  # map pyttsx3-style rate to edge-tts percent
+    print(f"[speaking:{tone}] {text}", flush=True)
+    fd, path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    try:
+        asyncio.run(edge_tts.Communicate(text, voice, rate=f"{pct:+d}%").save(path))
+        _play_mp3_windows(path)
+    finally:
+        os.remove(path)
+
+
 def speak_isolated(text: str, rate: int = 175) -> None:
     """Speak via a throwaway process so pyttsx3 can't get stuck after the first utterance."""
     print(f"[speaking] {text}", flush=True)
@@ -564,6 +598,15 @@ def coach_speak(text, tone, lang, dry_run, engine_holder, rate=175):
         if subprocess.run(cmd + [text], capture_output=True).returncode != 0:
             subprocess.run(["say", "-r", str(rate), text])  # voice not installed
         return
+    if platform.system() == "Windows":
+        try:
+            speak_edge(text, lang, tone, rate)
+            return
+        except Exception as exc:
+            print(
+                f"[warning] neural voice failed ({exc}); using offline voice",
+                file=sys.stderr,
+            )
     speak_isolated(text, rate)
 
 
